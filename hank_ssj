@@ -1,0 +1,238 @@
+import numpy as np  # numpy helps us perform linear algebra calculations
+import matplotlib.pyplot as plt  # helps us plot
+import sequence_jacobian as sj  # SSJ will allow us to define blocks, models, compute IRFs, etc
+
+calibration = {'eis': 0.5,  # EIS
+               'rho_e': 0.9,  # Persistence of idiosyncratic productivity shocks
+               'sd_e': 0.92,  # Standard deviation of idiosyncratic productivity shocks
+               'G': 0.2,  # Government spending
+               'B': 0.8,  # Government debt
+               'Y': 1.,  # Output
+               'min_a': 0.,  # Minimum asset level on the grid
+               'max_a': 1_000,  # Maximum asset level on the grid
+               'n_a': 200,  # Number of asset grid points
+               'n_e': 10}  # Number of productivity grid points
+
+
+
+# initialize
+def hh_init(a_grid, z, r, eis):
+    coh = (1 + r) * a_grid[np.newaxis, :] + z[:, np.newaxis]
+    Va = (1 + r) * coh ** (-1 / eis)
+    return Va
+
+# backward step
+@sj.het(exogenous='Pi',  # <-- this means our transition matrix will be fed into the model as Pi (use this for forward iteration)
+        policy='a',  # <-- this means our endogenous state variable is a, defined over grid a_grid (we use this to check convergence)
+        backward='Va',  # <-- this means we're iterating over variable Va, whose future value is Va_p (solver needs to know this to iterate!)
+        backward_init=hh_init)
+def hh(Va_p, a_grid, z, r, beta, eis):
+    uc_nextgrid = beta * Va_p  # u'(c') on tomorrow's grid
+    c_nextgrid = uc_nextgrid ** (-eis)  # c' on tomorrow's grid
+    coh = (1 + r) * a_grid[np.newaxis, :] + z[:, np.newaxis]  # cash on hand on today's grid
+    a = sj.interpolate.interpolate_y(c_nextgrid + a_grid, coh, a_grid)  # this plots (c_next + a', a') pairs and computes policy a' from interpolation on coh
+    sj.misc.setmin(a, a_grid[0])  # impose borrowing constraint
+    c = coh - a  # back out consumption
+    Va = (1 + r) * c ** (-1 / eis)  # V'(a)
+    return Va, a, c
+
+def make_grids(rho_e, sd_e, n_e, min_a, max_a, n_a):
+    e_grid, _, Pi = sj.grids.markov_rouwenhorst(rho_e, sd_e, n_e)
+    a_grid = sj.grids.asset_grid(min_a, max_a, n_a)
+    return e_grid, Pi, a_grid
+
+def income(Z, e_grid):
+    z = Z * e_grid
+    return z
+
+hh_extended = hh.add_hetinputs([make_grids, income])
+
+@sj.simple
+def fiscal(B, r, G, Y):
+    T = (1 + r) * B(-1) + G - B  # total tax burden
+    Z = Y - T  # after tax income
+    deficit = G - T
+    return T, Z, deficit
+
+@sj.simple
+def mkt_clearing(A, B, Y, C, G):
+    asset_mkt = A - B
+    goods_mkt = Y - C - G
+    return asset_mkt, goods_mkt
+
+ha = sj.create_model([hh_extended, fiscal, mkt_clearing], name="Simple HA Model")
+
+calibration['r'] = 0.03
+calibration['beta'] = 0.85
+
+ss = ha.steady_state(calibration)
+ss['asset_mkt']
+
+unknowns_ss = {'beta': (0.75, 0.9)}  # provide bounds on beta for the solver
+targets_ss = ['asset_mkt']  # set the ss target
+
+ss = ha.solve_steady_state(calibration, unknowns_ss, targets_ss)
+
+
+#### Calibrate MPCs to 0.25
+
+def compute_weighted_mpc(c, a, a_grid, r, e_grid):
+    """Approximate mpc out of wealth, with symmetric differences where possible, exactly setting mpc=1 for constrained agents."""
+    mpc = np.empty_like(c)
+    post_return = (1 + r) * a_grid
+    mpc[:, 1:-1] = (c[:, 2:] - c[:, 0:-2]) / (post_return[2:] - post_return[:-2])
+    mpc[:, 0] = (c[:, 1] - c[:, 0]) / (post_return[1] - post_return[0])
+    mpc[:, -1] = (c[:, -1] - c[:, -2]) / (post_return[-1] - post_return[-2])
+    mpc[a == a_grid[0]] = 1
+    mpc = mpc * e_grid[:, np.newaxis]
+    return mpc
+
+hh_extended = hh_extended.add_hetoutputs([compute_weighted_mpc])
+
+ha = sj.create_model([hh_extended, fiscal, mkt_clearing], name="Simple HA Model")
+
+unknowns_ss = {'beta': 0.8, 'B': 0.4}
+targets_ss = {'asset_mkt': 0., 'MPC': 0.25}  # <-- with a dict rather than a list, we can specify specific targets for output variables
+
+ss_mpc = ha.solve_steady_state(calibration, unknowns_ss, targets_ss)
+
+ss = ss_mpc
+
+# plot wealth distribution
+
+D = ss.internals['hh']['D'].sum(axis=0)
+a_grid = ss.internals['hh']['a_grid']
+plt.plot(a_grid, D.cumsum())
+plt.ylim([0.2, 1])
+plt.xlim([0, 5])
+plt.xlabel('Assets')
+plt.ylabel('Cumulative distribution')
+plt.show()
+
+#### Impulse Responses
+
+T = 300  # <-- the length of the IRF
+rho_G = 0.8
+dG = 0.01 * rho_G ** np.arange(T)   # fully tax-financed increase in government spending
+shocks = {'G': dG}
+
+unknowns_td = ['Y']
+targets_td = ['asset_mkt']
+
+irfs = ha.solve_impulse_linear(ss, unknowns_td, targets_td, shocks)
+
+
+def show_irfs(irfs_list, variables, labels=[" "], ylabel=r"Percentage points (dev. from ss)", T_plot=50, figsize=(18, 6)):
+    if len(irfs_list) != len(labels):
+        labels = [" "] * len(irfs_list)
+    n_var = len(variables)
+    fig, ax = plt.subplots(1, n_var, figsize=figsize, sharex=True)
+    for i in range(n_var):
+        # plot all irfs
+        for j, irf in enumerate(irfs_list):
+            ax[i].plot(100 * irf[variables[i]][:50], label=labels[j])
+        ax[i].set_title(variables[i])
+        ax[i].set_xlabel(r"$t$")
+        if i==0:
+            ax[i].set_ylabel(ylabel)
+        ax[i].legend()
+    plt.show()
+
+
+show_irfs([irfs], ['G', 'Y', 'goods_mkt'])
+
+
+rho_B = 0.9
+dB = np.cumsum(dG) * rho_B ** np.arange(T)
+shocks_B = {'G': dG, 'B': dB}
+
+irfs_B = ha.solve_impulse_linear(ss, unknowns_td, targets_td, shocks_B)
+
+show_irfs([irfs, irfs_B], ['G', 'Y', 'deficit'], labels=["balanced budget", "deficit financed"])
+
+
+show_irfs([irfs, irfs_B], ['G', 'Y', 'C'], labels=["balanced budget", "deficit financed"], figsize=(18,6))
+
+
+
+#### Phillips curve and Taylor Rule
+
+@sj.simple
+def nkpc(pi, Y, C, theta_w, vphi, frisch, markup_ss, eis, beta):
+    kappa_w = (1 - theta_w) * (1 - beta * theta_w)/theta_w
+    piwres = kappa_w * (vphi * (Y)**(1/frisch) - 1/markup_ss * C**(-1/eis)) + beta * pi(1) - pi
+    return piwres
+
+
+@sj.simple
+def monetary_taylor(pi, ishock, rss, phi_pi):
+    i = rss + phi_pi * pi + ishock
+    r_ante = i - pi(1)
+    return r_ante
+
+@sj.simple
+def ex_post_rate(r_ante):
+    r = r_ante(-1)
+    return r
+
+ha_taylor = sj.create_model([monetary_taylor, ex_post_rate, fiscal, hh_extended, mkt_clearing, nkpc], name="Simple HA Model with Taylor")
+
+calibration.update({'pi':0, 'theta_w': 0.9, 'vphi':1, 'frisch':1, 'markup_ss':1, 'ishock': 0, 'rss': calibration['r'], 'phi_pi':1.5})
+
+ss_taylor = ha_taylor.solve_steady_state(calibration, unknowns={'vphi': 1, 'beta': ss['beta']}, targets=['piwres', 'asset_mkt'])
+
+irfs_taylor = ha_taylor.solve_impulse_linear(ss_taylor, ['pi', 'Y'], ['asset_mkt', 'piwres'], shocks_B)
+
+show_irfs([irfs_B, irfs_taylor], ['G', 'Y', 'deficit'], labels=["Real rate rule", "Taylor rule"])
+
+
+#### Representative Agent Model Comparison
+
+@sj.solved(unknowns={'C': 1, 'A': 1},
+           targets=["euler", "budget_constraint"])  # solver="broyden_custom")
+def hh_ra(C, A, Z, eis, beta, r):
+    euler = (beta * (1 + r(+1)))**(-eis) * C(+1) - C
+    budget_constraint = (1 + r) * A(-1) + Z - C - A
+    MPC = 0
+    return euler, budget_constraint, MPC
+
+ra = sj.create_model([hh_ra, fiscal, mkt_clearing], name="Representative agent model")
+
+
+#### Two Agent Model Comparison
+
+@sj.solved(unknowns={'C_RA': 1, 'A': 1},
+           targets=["euler", "budget_constraint"])  # , solver="broyden_custom")
+def hh_ta(C_RA, A, Z, eis, beta, r, lam):
+    euler = (beta * (1 + r(+1))) ** (-eis) * C_RA(+1) - C_RA      # consumption of infinitely lived household
+    C_H2M = Z   # computes consumption of an hand to mouth agent
+    C = (1 - lam) * C_RA + lam * C_H2M
+    budget_constraint = (1 + r) * A(-1) + Z - C - A
+    MPC = 0
+    return euler, budget_constraint, C_H2M, C, MPC
+
+ta = sj.create_model([hh_ta, fiscal, mkt_clearing], name="Two agent model")
+
+
+calibration_ra = calibration.copy()
+calibration_ra['beta'] = 1 / (1 + calibration_ra['r'])
+calibration_ra['B'] = ss['B']
+
+unknowns_ra_ss = {'C': 1., 'A': 0.8}
+targets_ra_ss = {'budget_constraint': 0., 'asset_mkt': 0.}
+
+ss_ra = ra.solve_steady_state(calibration_ra, unknowns_ra_ss, targets_ra_ss, dissolve=['hh_ra'])
+
+
+calibration_ta = calibration_ra.copy()
+calibration_ta['lam'] = 0.25
+unknowns_ta_ss = {'C_RA': 1., 'A': 0.8}
+
+ss_ta = ta.solve_steady_state(calibration_ta, unknowns_ta_ss, targets_ra_ss, dissolve=['hh_ta'])
+
+#### IRFs Comparison between HA/RA/TA
+
+irfs_ra = ra.solve_impulse_linear(ss_ra, unknowns_td, targets_td, shocks_B)
+irfs_ta = ta.solve_impulse_linear(ss_ta, unknowns_td, targets_td, shocks_B)
+
+show_irfs([irfs_B, irfs_ra, irfs_ta], variables=['deficit', 'Y', 'C'], labels=['HA', 'RA', 'TA'])

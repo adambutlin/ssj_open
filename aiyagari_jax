@@ -1,0 +1,132 @@
+!pip install quantecon jax
+
+import quantecon as qe
+import matplotlib.pyplot as plt
+import jax
+import jax.numpy as jnp
+from typing import NamedTuple
+from scipy.optimize import bisect
+
+jax.config.update("jax_enable_x64", True)
+
+## inititalise matrices
+class Model(NamedTuple):
+    β: float              # Discount factor
+    R: float              # Gross interest rate
+    γ: float              # CRRA parameter
+    a_grid: jnp.ndarray   # Asset grid
+    y_grid: jnp.ndarray   # Income grid
+    Q: jnp.ndarray        # Markov matrix for income
+
+
+def create_consumption_model(
+        R=1.01,                    # Gross interest rate
+        β=0.98,                    # Discount factor
+        γ=2,                       # CRRA parameter
+        a_min=0.01,                # Min assets
+        a_max=10.0,                # Max assets
+        a_size=150,                # Grid size
+        ρ=0.9, ν=0.1, y_size=100   # Income parameters
+    ):
+    """
+    Creates an instance of the consumption-savings model.
+
+    """
+    a_grid = jnp.linspace(a_min, a_max, a_size)
+    mc = qe.tauchen(n=y_size, rho=ρ, sigma=ν)
+    y_grid, Q = jnp.exp(mc.state_values), jax.device_put(mc.P)
+    return Model(β, R, γ, a_grid, y_grid, Q)
+
+## compute value function
+@jax.jit
+def B(v, model):
+    """
+    A vectorized version of the right-hand side of the Bellman equation
+    (before maximization), which is a 3D array representing
+
+        B(a, y, a′) = u(Ra + y - a′) + β Σ_y′ v(a′, y′) Q(y, y′)
+
+    for all (a, y, a′).
+    """
+
+    # Unpack
+    β, R, γ, a_grid, y_grid, Q = model
+    a_size, y_size = len(a_grid), len(y_grid)
+
+    # Compute current rewards r(a, y, ap) as array r[i, j, ip]
+    a  = jnp.reshape(a_grid, (a_size, 1, 1))    # a[i]   ->  a[i, j, ip]
+    y  = jnp.reshape(y_grid, (1, y_size, 1))    # z[j]   ->  z[i, j, ip]
+    ap = jnp.reshape(a_grid, (1, 1, a_size))    # ap[ip] -> ap[i, j, ip]
+    c = R * a + y - ap
+
+    # Calculate continuation rewards at all combinations of (a, y, ap)
+    v = jnp.reshape(v, (1, 1, a_size, y_size))  # v[ip, jp] -> v[i, j, ip, jp]
+    Q = jnp.reshape(Q, (1, y_size, 1, y_size))  # Q[j, jp]  -> Q[i, j, ip, jp]
+    EV = jnp.sum(v * Q, axis=3)                 # sum over last index jp
+
+    # Compute the right-hand side of the Bellman equation
+    return jnp.where(c > 0, c**(1-γ)/(1-γ) + β * EV, -jnp.inf)
+
+
+@jax.jit
+def T(v, model):
+    "The Bellman operator."
+    return jnp.max(B(v, model), axis=2)
+
+## compute policy function from value function
+@jax.jit
+def get_greedy(v, model):
+    "Computes a v-greedy policy, returned as a set of indices."
+    return jnp.argmax(B(v, model), axis=2)
+
+## value function iteration
+def value_function_iteration_python(model, tol=1e-5, max_iter=10_000):
+    """
+    Implements VFI using successive approximation with a Python loop.
+    """
+    v = jnp.zeros((len(model.a_grid), len(model.y_grid)))
+    error = tol + 1
+    k = 0
+
+    while error > tol and k < max_iter:
+        v_new = T(v, model)
+        error = jnp.max(jnp.abs(v_new - v))
+        v = v_new
+        k += 1
+
+    return v, get_greedy(v, model)
+
+@jax.jit
+def value_function_iteration(model, tol=1e-5, max_iter=10_000):
+    """
+    Implements VFI using successive approximation.
+    """
+    def body_fun(k_v_err):
+        k, v, error = k_v_err
+        v_new = T(v, model)
+        error = jnp.max(jnp.abs(v_new - v))
+        return k + 1, v_new, error
+
+    def cond_fun(k_v_err):
+        k, v, error = k_v_err
+        return jnp.logical_and(error > tol, k < max_iter)
+
+    v_init = jnp.zeros((len(model.a_grid), len(model.y_grid)))
+    k, v_star, error = jax.lax.while_loop(cond_fun, body_fun,
+                                          (1, v_init, tol + 1))
+    return v_star, get_greedy(v_star, model)
+
+## plot wealth dynamics by income
+fig, ax = plt.subplots()
+
+# Plot asset accumulation for first and last income states
+for j, label in zip([0, -1], ['low income', 'high income']):
+    # Get next-period assets for each current asset level
+    a_next = model.a_grid[σ_star_jax[:, j]]
+    ax.plot(model.a_grid, a_next, label=label)
+
+# Add 45-degree line
+ax.plot(model.a_grid, model.a_grid, 'k--', linewidth=0.5)
+ax.set(xlabel='current assets', ylabel='next period assets')
+ax.legend()
+plt.show()
